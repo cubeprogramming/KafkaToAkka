@@ -1,96 +1,78 @@
 package no.sysco
 
-import java.time.Duration
-import java.util.{Collections, Properties}
+import java.nio.file.{FileSystems, Files}
+import java.time.Instant
+import java.util.concurrent.TimeUnit
 
-import akka.NotUsed
 import akka.actor.ActorSystem
-import akka.kafka.ConsumerMessage.CommittableOffsetBatch
-import akka.stream.{ActorMaterializer, IOResult}
-import better.files.File
-//import better.files.Scanner.Source
-import akka.kafka._
-import akka.stream._
-import akka.stream.scaladsl._
+import akka.kafka.scaladsl.Consumer.committableSource
+import akka.kafka.scaladsl.{Committer, Consumer}
+import akka.kafka.{CommitterSettings, ConsumerMessage, ConsumerSettings, Subscriptions}
+import akka.stream.scaladsl.{FileIO, Flow, Sink, Source}
+import akka.stream.{ActorMaterializer, OverflowStrategy, ThrottleMode}
 import akka.util.ByteString
-import org.apache.kafka.clients.consumer._
+import akka.{Done, NotUsed}
+import com.typesafe.config.ConfigFactory
+import org.apache.kafka.clients.consumer.ConsumerConfig
 import org.apache.kafka.common.serialization.StringDeserializer
 
-import scala.collection.JavaConverters._
-import scala.concurrent.Future
-import scala.concurrent.duration._
+import scala.concurrent.duration.Duration
+import scala.concurrent.{ExecutionContextExecutor, Future}
 
 //#main-class
 object KafkaReader extends App {
-  val bootstrapServers = "127.0.0.1:9092"
-  val groupId = "kafka-to-akka"
-  val topic = "csv_lines"
+  val appConfig: ApplicationConfig = ApplicationConfig(ConfigFactory.load())
+  val bootstrapServers = appConfig.Kafka.bootstrapServers
+  val topic = appConfig.Kafka.topic
 
   // create Actor system
   implicit val system = ActorSystem("kafka-consumer")
   implicit val materializer = ActorMaterializer()
+  implicit val executionContext: ExecutionContextExecutor = materializer.executionContext
 
-  val sink1 = lineSink("resources/output1.txt")
-  val sink2 = lineSink("resources/output2.txt")
-  val slowSink2 = Flow[String].via(Flow[String].throttle(1, 1.second, 1, ThrottleMode.shaping)).toMat(sink2)(Keep.right)
-  val bufferedSink2 = Flow[String].buffer(50, OverflowStrategy.backpressure).via(Flow[String].throttle(1, 1.second, 1, ThrottleMode.shaping)).toMat(sink2)(Keep.right)
+  val fs = FileSystems.getDefault
 
+  println(system.settings.config.getConfig("akka.kafka.consumer"))
 
-  // create consumer configs
-  val config = system.settings.config.getConfig("akka.kafka.consumer")
-  val consumerSettings =
-    ConsumerSettings(config, new StringDeserializer, new StringDeserializer)
-      .withBootstrapServers(bootstrapServers)
-      .withGroupId(groupId)
+  val consumerSettings: ConsumerSettings[String, String] = {
+    ConsumerSettings(
+      system,
+      new StringDeserializer,
+      new StringDeserializer
+    )
+      .withBootstrapServers(appConfig.Kafka.bootstrapServers)
       .withProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-
-
-
-  val done = Consumer.committablePartitionedSource(consumerSettings, Subscriptions.topics(topic))
-    .flatMapMerge(maxPartitions, _._2)
-    .via(business)
-    .batch(max = 20, first => CommittableOffsetBatch.empty.updated(first.committableOffset)) { (batch, elem) =>
-      batch.updated(elem.committableOffset)
-    }
-    .mapAsync(3)(_.commitScaladsl())
-    .runWith(Sink.ignore)
-
-
-  val properties = new Properties
-  properties.setProperty(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers)
-  properties.setProperty(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, classOf[StringDeserializer].getName)
-  properties.setProperty(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, classOf[StringDeserializer].getName)
-  properties.setProperty(ConsumerConfig.GROUP_ID_CONFIG, groupId)
-  properties.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest")
-
-  // create consumer
-  val consumer = new KafkaConsumer[String,String](properties)
-
-  // subscribe consumer to our topic
-  consumer.subscribe(Collections.singleton(topic))
-
-  //poll for new data
-
-  val g = RunnableGraph.fromGraph(GraphDSL.create() { implicit b =>
-    import GraphDSL.Implicits._
-
-    val bcast = b.add(Broadcast[String](2))
-    val consumerRecords: ConsumerRecords[String,String] = consumer.poll(Duration.ofMillis(100))
-    val jsonRec: Source[String, NotUsed] = Source(consumerRecords.asScala.map(record => record.value()).toStream)
-    jsonRec ~> bcast.in
-    bcast.out(0) ~> sink1
-    bcast.out(1) ~> bufferedSink2
-    ClosedShape
-  })
-
-  g.run()
-
-
-  def lineSink(filename: String): Sink[String, Future[IOResult]] = {
-    Flow[String]
-      .alsoTo(Sink.foreach(s => println(s"$filename: $s")))
-      .map(s => ByteString(s + "\n"))
-      .toMat(FileIO.toPath(File(filename).path))(Keep.right)
+      .withGroupId("kafka-to-akka-group-1")
+      .withClientId("kafka-to-akka-id-1")
   }
+
+  val committerSettings = CommitterSettings(system)
+  val committerSink: Sink[ConsumerMessage.Committable, Future[Done]] = Committer.sink(committerSettings)
+
+  val kafkaSourceCommittable: Source[ConsumerMessage.CommittableMessage[String, String], Consumer.Control] =
+    committableSource(consumerSettings, Subscriptions.topics(topic))
+
+  val flowFile: Flow[ConsumerMessage.CommittableMessage[String, String], ConsumerMessage.CommittableOffset, NotUsed] = Flow[ConsumerMessage.CommittableMessage[String, String]]
+    .map(msg => {
+      val path = Files.createTempFile(fs.getPath("outputs"), s"${msg.record.key}-${Instant.now.toEpochMilli}", ".log")
+      Source.single(ByteString(msg.record.value())).runWith(FileIO.toPath(path)).onComplete(done => {
+        if(done.isSuccess) {
+          println(s"Commit msg with key: ${msg.record.key()} \n and value: ${msg.record.value()}")
+          msg.committableOffset.commitScaladsl()
+        }
+        else {
+          println(s"roll back || do not commit || stop stream || FAILED with msg : ${msg.record.key()}")
+          system.terminate()
+          //msg.committableOffset.commitScaladsl()
+        }
+      })
+      msg.committableOffset
+    })
+    .buffer(20, OverflowStrategy.backpressure)
+    .throttle(10, Duration.create(5, TimeUnit.SECONDS), 5, ThrottleMode.shaping)
+
+
+  kafkaSourceCommittable.via(flowFile).runWith(Sink.ignore)
+
 }
 //#main-class

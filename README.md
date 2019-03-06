@@ -1,6 +1,6 @@
 # KafkaToAkka
 
-This is a Demo project which purpose is to demonstrate Akk Actor connection with Kafka as Client and implementing back pressure while writing output to a file
+This is a Demo project which purpose is to demonstrate Akka Actor connection with Kafka as Client and implementing back pressure while writing output to a file
 
 ## Code description
 
